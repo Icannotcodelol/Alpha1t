@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-1000"
+version = "0.1.0"
+description = "Alpha-1000: Professional Tysiac engine and RL agent"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Alpha Team"}]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pydantic>=2.6",
+    "streamlit>=1.31",
+    "torch>=2.1",
+    "pandas>=2.2",
+    "typing-extensions>=4.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "hypothesis>=6.87",
+    "black>=24.2",
+    "mypy>=1.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alpha_1000*"]

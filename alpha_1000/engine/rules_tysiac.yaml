@@ -1,0 +1,17 @@
+game:
+  target_score: 1000
+  lock_score: 800
+  enable_lock: true
+
+bidding:
+  start_bid: 100
+  increment: 10
+  proof_threshold: 120
+
+bombing:
+  enabled: true
+  bombs_per_player: 2
+
+trick_rules:
+  must_overtake: true
+  must_overtrump: true
