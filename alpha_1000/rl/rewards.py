@@ -19,12 +19,13 @@ __all__ = [
 class RewardConfig:
     """Configuration values used for reward shaping."""
 
-    trick_win_bonus: float = 1.0
-    trick_loss_penalty: float = -0.2
-    meld_bonus: float = 0.05
-    bomb_penalty: float = -0.5
-    precise_contract_bonus: float = 0.5
+    trick_win_bonus: float = 0.01  # Smaller, more frequent rewards
+    trick_loss_penalty: float = -0.005
+    meld_bonus: float = 0.02
+    bomb_penalty: float = -0.1
+    precise_contract_bonus: float = 0.1
     point_scale: float = 100.0
+    contract_scale: float = 0.01  # Scale contract rewards appropriately
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostic helper
         return (
@@ -46,8 +47,11 @@ def contract_reward(state: GameState, *, achieved: bool, config: RewardConfig | 
     """Return reward based on contract success or failure."""
 
     cfg = config or RewardConfig()
-    base = float(state.current_bid or 0) / cfg.point_scale
-    return base + cfg.precise_contract_bonus if achieved else base + cfg.trick_loss_penalty
+    base = float(state.current_bid or 0) * cfg.contract_scale
+    if achieved:
+        return base + cfg.precise_contract_bonus
+    else:
+        return -(base * 0.5) + cfg.trick_loss_penalty  # Negative reward for failure
 
 
 def meld_reward(config: RewardConfig | None = None) -> float:

@@ -7,7 +7,7 @@ from typing import Dict
 import torch
 from torch import nn
 
-from ..encoding import CARDS_DIM, MAX_HAND_CARDS
+from ..encoding import CARDS_DIM, MAX_HAND_CARDS, META_DIM
 
 __all__ = ["TysiacNetwork"]
 
@@ -17,17 +17,68 @@ class TysiacNetwork(nn.Module):
 
     def __init__(self, hidden_size: int = 256, lstm_layers: int = 2) -> None:
         super().__init__()
-        self.card_encoder = nn.Sequential(nn.Linear(CARDS_DIM, hidden_size), nn.ReLU())
-        self.trick_encoder = nn.Sequential(nn.Linear(CARDS_DIM, hidden_size), nn.ReLU())
-        self.meta_encoder = nn.Sequential(nn.Linear(20, hidden_size), nn.ReLU())
+        # Encoders with layer normalization for stability
+        self.card_encoder = nn.Sequential(
+            nn.Linear(CARDS_DIM, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Tanh()  # Bounded activation
+        )
+        self.trick_encoder = nn.Sequential(
+            nn.Linear(CARDS_DIM, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Tanh()
+        )
+        # Meta input is concatenation of: melds (2x4), bombs (2), scores (2), and meta (META_DIM)
+        meta_input_dim = 8 + 2 + 2 + META_DIM  # = 32 with 4 suits
+        self.meta_encoder = nn.Sequential(
+            nn.Linear(meta_input_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Tanh()
+        )
         self.history_lstm = nn.LSTM(hidden_size, hidden_size, lstm_layers, batch_first=True)
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4, dropout=0.1, batch_first=True)
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4, dropout=0.0, batch_first=True)  # Remove dropout from attention
         fusion_dim = hidden_size * 3
-        self.fusion = nn.Sequential(nn.Linear(fusion_dim, hidden_size), nn.ReLU(), nn.Dropout(0.1))
-        self.bid_head = nn.Sequential(nn.Linear(hidden_size, hidden_size // 2), nn.ReLU(), nn.Linear(hidden_size // 2, 20))
-        self.play_head = nn.Sequential(nn.Linear(hidden_size, hidden_size // 2), nn.ReLU(), nn.Linear(hidden_size // 2, MAX_HAND_CARDS))
-        self.bomb_head = nn.Sequential(nn.Linear(hidden_size, hidden_size // 2), nn.ReLU(), nn.Linear(hidden_size // 2, 2))
-        self.value_head = nn.Sequential(nn.Linear(hidden_size, hidden_size // 2), nn.ReLU(), nn.Linear(hidden_size // 2, 1))
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Tanh()
+        )
+        # Policy heads with smaller final layer initialization
+        self.bid_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 20)
+        )
+        self.play_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, MAX_HAND_CARDS)
+        )
+        self.bomb_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 2)
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        # Initialize policy head final layers with small weights
+        for head in [self.bid_head, self.play_head, self.bomb_head]:
+            if isinstance(head[-1], nn.Linear):
+                nn.init.orthogonal_(head[-1].weight, gain=0.01)
+                nn.init.constant_(head[-1].bias, 0)
+        
+        # Initialize value head
+        if isinstance(self.value_head[-1], nn.Linear):
+            nn.init.orthogonal_(self.value_head[-1].weight, gain=1.0)
+            nn.init.constant_(self.value_head[-1].bias, 0)
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Run a forward pass returning logits for each head and the value."""

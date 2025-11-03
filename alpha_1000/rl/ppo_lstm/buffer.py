@@ -24,6 +24,7 @@ class Transition:
     done: torch.Tensor
     advantage: torch.Tensor | None = None
     return_: torch.Tensor | None = None
+    masks: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return f"Transition(reward={float(self.reward)})"
@@ -34,9 +35,33 @@ class RolloutBuffer:
     """Buffer accumulating PPO trajectories with GAE computation."""
 
     transitions: List[Transition] = field(default_factory=list)
+    reward_mean: float = 0.0
+    reward_std: float = 1.0
+    reward_count: int = 0
 
     def __repr__(self) -> str:  # pragma: no cover - trivial helper
         return f"RolloutBuffer(size={len(self.transitions)})"
+    
+    def normalize_rewards(self, beta: float = 0.99) -> None:
+        """Normalize rewards using running statistics."""
+        if not self.transitions:
+            return
+        
+        # Collect all rewards
+        rewards = [float(t.reward.item()) for t in self.transitions]
+        
+        # Update running mean and std
+        for r in rewards:
+            self.reward_count += 1
+            delta = r - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            delta2 = r - self.reward_mean
+            self.reward_std = max(0.01, ((self.reward_std ** 2) * (self.reward_count - 1) + delta * delta2) / self.reward_count) ** 0.5
+        
+        # Normalize transition rewards
+        for t in self.transitions:
+            normalized = (float(t.reward.item()) - self.reward_mean) / (self.reward_std + 1e-8)
+            t.reward = torch.tensor(normalized, dtype=torch.float32)
 
     def add(self, transition: Transition) -> None:
         """Append a transition to the buffer."""
@@ -71,6 +96,13 @@ class RolloutBuffer:
         for start in range(0, len(self.transitions), batch_size):
             yield self.transitions[start : start + batch_size]
 
+    def iter_head_batches(self, head: str, batch_size: int) -> Iterator[List[Transition]]:
+        """Yield mini-batches filtered to transitions that include `head`."""
+
+        filtered = [t for t in self.transitions if head in t.actions]
+        for start in range(0, len(filtered), batch_size):
+            yield filtered[start : start + batch_size]
+
     def stack_observations(self, batch: Iterable[Transition]) -> Dict[str, torch.Tensor]:
         """Stack observation tensors for the given batch."""
 
@@ -78,8 +110,6 @@ class RolloutBuffer:
         for transition in batch:
             for key, array in transition.observation.tensors.items():
                 tensor = torch.as_tensor(array, dtype=torch.float32)
-                if tensor.ndim == 1:
-                    tensor = tensor.unsqueeze(0)
                 stacked.setdefault(key, []).append(tensor)
         return {key: torch.stack(values, dim=0) for key, values in stacked.items()}
 
@@ -92,6 +122,14 @@ class RolloutBuffer:
         """Stack log probabilities for the specified head."""
 
         return torch.stack([transition.log_probs[head] for transition in batch], dim=0)
+
+    def stack_masks(self, batch: Iterable[Transition], head: str) -> torch.Tensor | None:
+        """Stack action masks for the specified head if present."""
+
+        masks = [transition.masks.get(head) for transition in batch if transition.masks is not None]  # type: ignore[union-attr]
+        if not masks or any(m is None for m in masks):
+            return None
+        return torch.stack([m for m in masks if m is not None], dim=0)  # type: ignore[arg-type]
 
     def stack_values(self, batch: Iterable[Transition]) -> torch.Tensor:
         """Stack value predictions."""

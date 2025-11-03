@@ -35,6 +35,7 @@ class PpoLstmAgent:
     network: TysiacNetwork
     optimizer: torch.optim.Optimizer
     device: torch.device
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - trivial helper
         return f"PpoLstmAgent(network={self.network.__class__.__name__})"
@@ -46,8 +47,21 @@ class PpoLstmAgent:
         net = TysiacNetwork()
         dev = device or torch.device("cpu")
         net.to(dev)
-        optimiser = torch.optim.AdamW(net.parameters(), lr=learning_rate, betas=(0.9, 0.999))
-        return cls(network=net, optimizer=optimiser, device=dev)
+        # Use AdamW with weight decay for regularization
+        optimiser = torch.optim.AdamW(
+            net.parameters(),
+            lr=learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=1e-4
+        )
+        # Add cosine annealing scheduler for gradual LR decay
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimiser,
+            T_max=10000,  # Reset every 10k iterations
+            eta_min=learning_rate * 0.1
+        )
+        return cls(network=net, optimizer=optimiser, device=dev, scheduler=scheduler)
 
     def act(
         self,
@@ -78,8 +92,12 @@ class PpoLstmAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=0.5)
+        # Clip gradients by value AND norm for double protection
+        torch.nn.utils.clip_grad_value_(self.network.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
         self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
 
     def _to_torch(self, observation: Observation) -> Dict[str, torch.Tensor]:
         """Convert numpy observation tensors into torch tensors on device."""

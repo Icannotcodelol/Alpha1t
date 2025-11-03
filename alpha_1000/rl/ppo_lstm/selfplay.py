@@ -11,7 +11,13 @@ import torch
 
 from ...engine.game import TysiacGame
 from ...engine.state import PlayerID
-from ..encoding import Observation, encode_action_mask, encode_state
+from ..encoding import (
+    Observation,
+    encode_action_mask,
+    encode_bid_action_mask,
+    encode_bomb_action_mask,
+    encode_state,
+)
 from ..replay import ReplayWriter
 from ..rewards import RewardConfig, contract_reward, trick_reward
 from .agent import AgentOutput, PpoLstmAgent
@@ -29,6 +35,7 @@ class SelfPlayConfig:
     store_replays: bool = False
     replay_dir: Path | None = None
     curriculum_stage: int = 0
+    full_game: bool = False
 
 
 @dataclass
@@ -49,7 +56,10 @@ class SelfPlayWorker:
         for _ in range(self.config.games_per_iteration):
             game = TysiacGame.new(seed=rng.randint(0, 10_000))
             trajectory: List[Transition] = []
-            self._play_single_game(agent, game, buffer, trajectory)
+            if self.config.full_game:
+                self._play_full_game(agent, game, buffer, trajectory)
+            else:
+                self._play_single_hand(agent, game, buffer, trajectory)
             if replay_writer is not None:
                 replay_writer.write(trajectory)
 
@@ -63,28 +73,17 @@ class SelfPlayWorker:
         self.config.replay_dir.mkdir(parents=True, exist_ok=True)
         return ReplayWriter(directory=self.config.replay_dir)
 
-    def _play_single_game(
+    def _play_full_game(
         self,
         agent: PpoLstmAgent,
         game: TysiacGame,
         buffer: RolloutBuffer,
         trajectory: List[Transition],
     ) -> None:
-        """Play a single simplified game hand under self-play."""
+        """Play a full game until target score reached."""
 
-        game.deal()
-        state = game.state
-        game.bidding.start(state)
-        leader = (state.dealer + 1) % 2
-        start_bid = game.rules.bidding.start_bid
-        game.bidding.place_bid(state, leader, start_bid)
-        opponent = (leader + 1) % 2
-        game.bidding.place_bid(state, opponent, None)
-        state.playing_player = leader
-        state.current_bid = start_bid
-        game.musik.reveal(state, 0)
-        self._play_tricks(agent, game, buffer, trajectory)
-        game.scoring.score_hand(state, contract=start_bid)
+        while not game.is_finished():
+            self._play_single_hand(agent, game, buffer, trajectory)
 
     def _play_tricks(
         self,
@@ -106,12 +105,103 @@ class SelfPlayWorker:
             mask, index_map = encode_action_mask(state.hands[turn], legal_cards)
             agent_output = agent.act(observation, {"play": mask})
             card_index = self._map_action(agent_output.actions["play"], index_map)
-            transition = self._make_transition(observation, agent_output)
+            transition = self._make_transition(observation, agent_output, masks={"play": torch.as_tensor(mask)})
             trajectory.append(transition)
             buffer.add(transition)
             self._play_selected_card(game, turn, card_index)
             self._update_transition_rewards(state, turn, transition)
             turn = self._next_player(state, turn)
+
+    def _run_bidding(
+        self, agent: PpoLstmAgent, game: TysiacGame, buffer: RolloutBuffer, trajectory: List[Transition]
+    ) -> None:
+        """Conduct a basic two-player bidding where both sides use the agent policy."""
+
+        state = game.state
+        leader = (state.dealer + 1) % 2
+        current = leader
+        passes = {0: False, 1: False}
+        # Limit rounds to avoid infinite loops.
+        for _ in range(10):
+            observation = encode_state(state, current)
+            bid_mask, index_map = encode_bid_action_mask(state)
+            output = agent.act(observation, {"bid": bid_mask})
+            choice = int(output.actions["bid"].item())
+            bid_value = index_map[choice]
+            transition = self._make_transition(
+                observation,
+                output,
+                masks={"bid": torch.as_tensor(bid_mask)},
+            )
+            trajectory.append(transition)
+            buffer.add(transition)
+            if bid_value is None:
+                passes[current] = True
+            else:
+                game.bidding.place_bid(state, current, bid_value)
+                passes[current] = False
+            other = (current + 1) % 2
+            if passes[current] and passes[other]:
+                break
+            current = other
+
+        if state.playing_player is None:
+            # Ensure there is a declarer
+            state.playing_player = leader
+            state.current_bid = game.rules.bidding.start_bid
+
+        # Auto challenge if threshold exceeded
+        try:
+            other = (state.playing_player + 1) % 2  # type: ignore[operator]
+            if state.current_bid and state.current_bid > game.rules.bidding.proof_threshold:
+                game.bidding.challenge(state, challenger=other, target=state.playing_player)  # type: ignore[arg-type]
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _maybe_bomb(
+        self, agent: PpoLstmAgent, game: TysiacGame, buffer: RolloutBuffer, trajectory: List[Transition]
+    ) -> None:
+        """Let the declarer decide whether to bomb."""
+
+        state = game.state
+        player = state.playing_player or 0
+        observation = encode_state(state, player)
+        mask, _ = encode_bomb_action_mask(state, player)
+        output = agent.act(observation, {"bomb": mask})
+        transition = self._make_transition(observation, output, masks={"bomb": torch.as_tensor(mask)})
+        trajectory.append(transition)
+        buffer.add(transition)
+        action = int(output.actions["bomb"].item())
+        if action == 0 and mask[0] > 0:
+            # Bomb selected
+            try:
+                game.musik.bomb(state, player=player, hand_index=0, reason="policy")
+            except Exception:  # pragma: no cover - robust to rule errors
+                pass
+
+    def _return_discard_if_needed(self, game: TysiacGame) -> None:
+        """If hand sizes exceed rules expectation after musik, return two cards."""
+
+        state = game.state
+        player = state.playing_player or 0
+        if len(state.hands[player]) > 10:
+            # Return first two cards by index
+            try:
+                game.musik.return_cards(state, player=player, cards=[0, 1])
+            except Exception:  # pragma: no cover - engine leniency
+                pass
+
+    def _declare_meld_if_any(self, game: TysiacGame) -> None:
+        """Record a single available marriage for the declarer if present."""
+
+        from ...engine.marriages import find_marriages
+
+        state = game.state
+        player = state.playing_player or 0
+        marriages = find_marriages(state.hands[player])
+        if marriages:
+            suit, king, queen = marriages[0]
+            state.meld_history.append((player, king, queen))
 
     def _play_selected_card(self, game: TysiacGame, player: PlayerID, index: int) -> None:
         """Play a card resolving trick progression."""
@@ -120,16 +210,18 @@ class SelfPlayWorker:
             index = 0
         game.play.play_card(game.state, player, index)
 
-    def _make_transition(self, observation: Observation, agent_output: AgentOutput) -> Transition:
+    def _make_transition(self, observation: Observation, agent_output: AgentOutput, *, masks: dict[str, torch.Tensor] | None = None) -> Transition:
         """Create a transition structure from agent outputs."""
 
+        heads = set(masks.keys()) if masks is not None else {"play"}
         return Transition(
             observation=observation,
-            actions={"play": agent_output.actions["play"]},
-            log_probs={"play": agent_output.log_probs["play"]},
+            actions={k: v for k, v in agent_output.actions.items() if k in heads},
+            log_probs={k: v for k, v in agent_output.log_probs.items() if k in heads},
             value=agent_output.value.detach(),
             reward=torch.tensor(0.0, dtype=torch.float32),
             done=torch.tensor(0.0, dtype=torch.float32),
+            masks=masks if masks is not None else {},
         )
 
     def _update_transition_rewards(self, state, player: PlayerID, transition: Transition) -> None:
@@ -177,3 +269,27 @@ class SelfPlayWorker:
             if pos != -1:
                 return pos
         return 0
+    def _play_single_hand(
+        self,
+        agent: PpoLstmAgent,
+        game: TysiacGame,
+        buffer: RolloutBuffer,
+        trajectory: List[Transition],
+    ) -> None:
+        """Play one hand including bidding, musik/bomb, melds, and tricks."""
+
+        game.deal()
+        state = game.state
+        game.bidding.start(state)
+        self._run_bidding(agent, game, buffer, trajectory)
+        # Reveal first musik for now.
+        game.musik.reveal(state, 0)
+        # Optional bombing decision by the declarer
+        self._maybe_bomb(agent, game, buffer, trajectory)
+        # Simple discard: return two first cards if too many
+        self._return_discard_if_needed(game)
+        # Optional meld declaration
+        self._declare_meld_if_any(game)
+        # Play tricks to completion
+        self._play_tricks(agent, game, buffer, trajectory)
+        game.scoring.score_hand(state, contract=state.current_bid or game.rules.bidding.start_bid)
